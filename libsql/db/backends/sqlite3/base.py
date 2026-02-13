@@ -1,12 +1,13 @@
 """
-libSQL backend for the sqlite3 module in the standard library.
+libSQL backend using the native libsql Python package (Rust bindings).
 """
 import datetime
 import decimal
 import warnings
 from collections.abc import Mapping
 from itertools import chain, tee
-from libsql_client import dbapi2 as Database
+
+import libsql as Database
 
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
@@ -23,13 +24,6 @@ from .operations import DatabaseOperations
 from .schema import DatabaseSchemaEditor
 
 
-def decoder(conv_func):
-    """
-    Convert bytestrings from Python's sqlite3 interface to a regular string.
-    """
-    return lambda s: conv_func(s.decode())
-
-
 def adapt_date(val):
     return val.isoformat()
 
@@ -38,15 +32,38 @@ def adapt_datetime(val):
     return val.isoformat(" ")
 
 
-Database.register_converter("bool", b"1".__eq__)
-Database.register_converter("date", decoder(parse_date))
-Database.register_converter("time", decoder(parse_time))
-Database.register_converter("datetime", decoder(parse_datetime))
-Database.register_converter("timestamp", decoder(parse_datetime))
+def adapt_time(val):
+    return val.isoformat()
 
-Database.register_adapter(decimal.Decimal, str)
-Database.register_adapter(datetime.date, adapt_date)
-Database.register_adapter(datetime.datetime, adapt_datetime)
+
+# Type adapters: convert Python types to SQLite-compatible values on input.
+# The libsql package does not support register_adapter/register_converter,
+# so we handle type conversion manually in SQLiteCursorWrapper.
+ADAPTERS = {
+    decimal.Decimal: str,
+    # datetime.datetime must come before datetime.date because
+    # datetime is a subclass of date.
+    datetime.datetime: adapt_datetime,
+    datetime.date: adapt_date,
+    datetime.time: adapt_time,
+}
+
+
+def _adapt_params(params):
+    """Adapt parameter values for libsql (which lacks register_adapter)."""
+    if params is None:
+        return None
+    if isinstance(params, Mapping):
+        return {k: _adapt_value(v) for k, v in params.items()}
+    return tuple(_adapt_value(v) for v in params)
+
+
+def _adapt_value(value):
+    """Adapt a single value using our ADAPTERS table."""
+    for type_, adapter in ADAPTERS.items():
+        if isinstance(value, type_):
+            return adapter(value)
+    return value
 
 
 class DatabaseWrapper(BaseDatabaseWrapper):
@@ -141,10 +158,12 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             )
         kwargs = {
             "database": settings_dict["NAME"],
-            "detect_types": Database.PARSE_DECLTYPES | Database.PARSE_COLNAMES,
             **settings_dict["OPTIONS"],
         }
 
+        # Pass auth_token from PASSWORD if provided.
+        if settings_dict.get("PASSWORD"):
+            kwargs.setdefault("auth_token", settings_dict["PASSWORD"])
 
         if "check_same_thread" in kwargs and kwargs["check_same_thread"]:
             warnings.warn(
@@ -169,7 +188,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return conn
 
     def create_cursor(self, name=None):
-        return self.connection.cursor(factory=SQLiteCursorWrapper)
+        return SQLiteCursorWrapper(self.connection.cursor())
 
     @async_unsafe
     def close(self):
@@ -288,26 +307,50 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 FORMAT_QMARK_REGEX = _lazy_re_compile(r"(?<!%)%s")
 
 
-class SQLiteCursorWrapper(Database.Cursor):
+class SQLiteCursorWrapper:
     """
-    Django uses the "format" and "pyformat" styles, but Python's sqlite3 module
-    supports neither of these styles.
+    Wraps a libsql Cursor to convert Django's parameter styles.
+
+    Django uses the "format" and "pyformat" styles, but libsql's cursor
+    supports only "qmark" style.
 
     This wrapper performs the following conversions:
 
     - "format" style to "qmark" style
     - "pyformat" style to "named" style
 
+    It also adapts parameter types since libsql does not support
+    register_adapter/register_converter.
+
     In both cases, if you want to use a literal "%s", you'll need to use "%%s".
     """
 
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def execute(self, query, params=None):
         if params is None:
-            return super().execute(query)
-        # Extract names if params is a mapping, i.e. "pyformat" style is used.
-        param_names = list(params) if isinstance(params, Mapping) else None
-        query = self.convert_query(query, param_names=param_names)
-        return super().execute(query, params)
+            self._cursor.execute(query)
+        else:
+            # Extract names if params is a mapping, i.e. "pyformat" style is used.
+            param_names = list(params) if isinstance(params, Mapping) else None
+            query = self.convert_query(query, param_names=param_names)
+            params = _adapt_params(params)
+            self._cursor.execute(query, params)
+        # Return self so chaining like cursor.execute(...).fetchone() works.
+        return self
 
     def executemany(self, query, param_list):
         # Extract names if params is a mapping, i.e. "pyformat" style is used.
@@ -318,7 +361,9 @@ class SQLiteCursorWrapper(Database.Cursor):
         else:
             param_names = None
         query = self.convert_query(query, param_names=param_names)
-        return super().executemany(query, param_list)
+        adapted = (_adapt_params(p) for p in param_list)
+        self._cursor.executemany(query, adapted)
+        return self
 
     def convert_query(self, query, *, param_names=None):
         if param_names is None:
@@ -327,3 +372,20 @@ class SQLiteCursorWrapper(Database.Cursor):
         else:
             # Convert from "pyformat" style to "named" style.
             return query % {name: f":{name}" for name in param_names}
+
+    def close(self):
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchmany(self, size=None):
+        if size is None:
+            return self._cursor.fetchmany()
+        return self._cursor.fetchmany(size)
+
+    def fetchall(self):
+        return self._cursor.fetchall()

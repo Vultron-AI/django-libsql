@@ -1,114 +1,72 @@
-# Django + LibSQL / Turso
+# Django + LibSQL / Turso (Native Bindings)
 
-This project integrates Turso/Libsql with Django, allowing you to use Libsql as a database backend for your Django
-applications.
+Fork of [aaronkazah/django-libsql](https://github.com/aaronkazah/django-libsql) that uses the native [`libsql`](https://pypi.org/project/libsql/) Python package (Rust bindings) instead of the deprecated `libsql-client` (Python WebSocket client).
+
+## Why this fork?
+
+- `libsql-client` is **archived and deprecated** by Turso
+- `libsql` is a **native Rust extension** — faster and more reliable
+- `libsql` supports **embedded replicas** (local SQLite file + remote sync)
 
 ## Installation
 
-To install the package, use pip:
+Install directly from the git repo:
 
 ```
-pip install django-libsql
+pip install git+https://github.com/Vultron-AI/django-libsql.git@main
 ```
 
 ## Configuration
 
-To use Libsql as your database backend, update your Django settings as follows:
+### Remote database (Turso)
 
 ```python
 DATABASES = {
     "default": {
         "ENGINE": "libsql.db.backends.sqlite3",
-        "NAME": "libsql://${your-db-name}.turso.io?authToken=${your-auth-token}",
+        "NAME": "libsql://${your-db-name}.turso.io",
+        "PASSWORD": "${your-auth-token}",
     }
 }
 ```
 
-Replace `${your-db-name}` and `${your-auth-token}` with your actual database name and authentication token.
+### Embedded replica (local file + remote sync)
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "libsql.db.backends.sqlite3",
+        "NAME": "local_replica.db",
+        "PASSWORD": "${your-auth-token}",
+        "OPTIONS": {
+            "sync_url": "libsql://${your-db-name}.turso.io",
+        },
+    }
+}
+```
+
+### Local SQLite file
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "libsql.db.backends.sqlite3",
+        "NAME": "db.sqlite3",
+    }
+}
+```
 
 ## Usage
 
-After configuration, you can use Django's ORM as usual. The Libsql backend will handle the database operations.
-
-### Running a Local LibSQL Server
-
-To start a local LibSQL server for development or testing, use the provided script:
-
-```
-./scripts/docker.sh
-```
-
-This script will start a LibSQL server in a Docker container.
-
-### Running Django app
-
-You can also clone this repository and run the example Django app:
-
-```
-git clone https://github.com/aaronkazah/django-libsql.git
-cd django-libsql
-./scripts/docker.sh
-python manage.py migrate
-python manage.py runserver
-```
-
-Feel free to modify the DATABASES configuration in `settings.py` to point to your local LibSQL server or turso.io.
-
-### Running Tests
-
-To run tests and verify the integration, use the provided script:
-
-```
-./scripts/test.sh
-```
-
-This script performs a self-lifecycle test:
-
-1. It starts a local LibSQL server using Docker.
-2. Runs the tests against this server.
-3. Destroys the server at the end of the test run.
-
-This process confirms that the integration is working correctly with an actual LibSQL server.
-
-## Self-Hosting
-
-If you want to host your own Libsql server, refer to the provided Docker script (`./scripts/docker.sh`). This script
-includes a working server setup along with key generation.
+After configuration, use Django's ORM as usual. The libsql backend handles all database operations.
 
 ## Known Issues
 
-The current implementation has some limitations due to the lack of support for custom functions in the `libsql_client`:
-
-1. Custom Django functions registered via `create_function` are not supported.
-2. Certain Django ORM features that rely on these custom functions will not work. For example:
+1. Custom Django functions registered via `create_function` are not supported by the `libsql` package.
+2. Certain Django ORM features that rely on custom functions will not work:
     - Date/time operations using `F()` objects
     - `dates()` queryset method
 
-For a complete list of unsupported functions, query the `pragma_function_list` table in your database.
-
-### Examples of Unsupported Operations
-
-1. Date difference annotation:
-   ```python
-   Company.objects.annotate(date_diff=F("valid_until") - F("made_at"))
-   ```
-
-2. Date truncation in queryset:
-   ```python
-   Company.objects.dates("last_updated", "year")
-   ```
-
-These operations will raise `django.db.utils.OperationalError` due to missing functions.
-
-Expect the issues above to be solved soon, already have a local solution working, but will ship new changes once i find the time.
 ## License
 
 This project is distributed under the MIT license.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-If you encounter any issues or have questions, please open an issue on the GitHub repository.
