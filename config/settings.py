@@ -54,7 +54,7 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-ROOT_URLCONF = "libsql.urls"
+ROOT_URLCONF = "config.urls"
 
 TEMPLATES = [
     {
@@ -72,7 +72,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = "libsql.wsgi.application"
+WSGI_APPLICATION = "config.wsgi.application"
 
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
@@ -99,16 +99,13 @@ DATABASES = {
         "NAME": BASE_DIR / "db.sqlite3",
     },
     "libsql": {
-        "ENGINE": "libsql.db.backends.sqlite3",
+        "ENGINE": "django_libsql.db.backends.sqlite3",
         # Point to local libsql server
-        # Token is 'admin'
-        "NAME": f"ws://0.0.0.0:8080?authToken={token}",
-        # disable SSL verification for local development
-        # do not use in production
-        # lookat the example below
+        "NAME": "http://0.0.0.0:8080",
+        "PASSWORD": token,
         "TEST": {
-            "ENGINE": "libsql.db.backends.sqlite3",
-            "NAME": f"ws://0.0.0.0:8080?authToken={token}",
+            "ENGINE": "django_libsql.db.backends.sqlite3",
+            "NAME": "http://0.0.0.0:8080",
         }
     }
 }
@@ -116,7 +113,7 @@ DATABASES = {
 # Example of using a LIBSQL database server database
 # DATABASES = {
 #     "default": {
-#         "ENGINE": "libsql.db.backends.sqlite3",
+#         "ENGINE": "django_libsql.db.backends.sqlite3",
 #         "NAME": "libsql://${your-db-name}.turso.io?authToken=${your-auth-token}",
 #     }
 # }

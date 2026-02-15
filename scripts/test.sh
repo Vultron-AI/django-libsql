@@ -21,6 +21,6 @@ echo "Starting libsql-server container..."
 
 # Run tests
 echo "Running tests..."
-python3 manage.py test
+uv run python manage.py test
 
 echo "Test execution completed."

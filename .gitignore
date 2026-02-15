@@ -263,6 +263,9 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
+# uv
+uv.lock
+
 # End of https://www.toptal.com/developers/gitignore/api/django,python
 db.sqlite3
 

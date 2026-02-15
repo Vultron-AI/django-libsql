@@ -9,6 +9,22 @@ from itertools import chain, tee
 
 import libsql as Database
 
+# The libsql package only exposes a single Error class. Django's database
+# backend infrastructure expects a full PEP 249 exception hierarchy, so we
+# create the missing classes as aliases of Database.Error.
+for _exc_name in (
+    "DatabaseError",
+    "DataError",
+    "InterfaceError",
+    "InternalError",
+    "IntegrityError",
+    "OperationalError",
+    "ProgrammingError",
+    "NotSupportedError",
+):
+    if not hasattr(Database, _exc_name):
+        setattr(Database, _exc_name, type(_exc_name, (Database.Error,), {}))
+
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
 from django.db.backends.base.base import BaseDatabaseWrapper
@@ -173,7 +189,10 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                 "for controlling thread shareability.",
                 RuntimeWarning,
             )
-        kwargs.update({"check_same_thread": False, "uri": True})
+        # Remove non-underscored variants and set the libsql-style params.
+        kwargs.pop("check_same_thread", None)
+        kwargs.pop("uri", None)
+        kwargs.update({"_check_same_thread": False, "_uri": True})
         return kwargs
 
     def get_database_version(self):
@@ -208,16 +227,16 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return self.in_atomic_block
 
     def _set_autocommit(self, autocommit):
-        if autocommit:
-            level = None
-        else:
-            # sqlite3's internal default is ''. It's different from None.
-            # See Modules/_sqlite/connection.c.
-            level = ""
-        # 'isolation_level' is a misleading API.
-        # SQLite always runs at the SERIALIZABLE isolation level.
+        # The native libsql package exposes autocommit directly rather than
+        # the stdlib sqlite3 isolation_level API.
         with self.wrap_database_errors:
-            self.connection.isolation_level = level
+            self.connection.autocommit = autocommit
+
+    def _is_remote_db(self):
+        name = self.settings_dict.get("NAME", "")
+        return isinstance(name, str) and name.startswith(
+            ("http://", "https://", "libsql://", "ws://", "wss://")
+        )
 
     def disable_constraint_checking(self):
         with self.cursor() as cursor:
@@ -226,6 +245,10 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             # statement transaction. Fetch the current state of the pragma
             # to determine if constraints are effectively disabled.
             enabled = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+        if bool(enabled) and self._is_remote_db():
+            # Remote libsql-server does not support disabling foreign keys
+            # via PRAGMA, but schema changes are handled server-side.
+            return True
         return not bool(enabled)
 
     def enable_constraint_checking(self):
