@@ -3,6 +3,7 @@ libSQL backend using the native libsql Python package (Rust bindings).
 """
 import datetime
 import decimal
+import logging
 import warnings
 from collections.abc import Mapping
 from itertools import chain, tee
@@ -207,7 +208,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return conn
 
     def create_cursor(self, name=None):
-        return SQLiteCursorWrapper(self.connection.cursor())
+        return SQLiteCursorWrapper(self.connection.cursor(), self)
 
     @async_unsafe
     def close(self):
@@ -312,6 +313,12 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                 )
 
     def is_usable(self):
+        try:
+            # Use the underlying connection directly to avoid Django's cursor
+            # wrappers and logging, which could cause recursion.
+            self.connection.execute("SELECT 1")
+        except Exception:
+            return False
         return True
 
     def _start_transaction_under_autocommit(self):
@@ -327,7 +334,15 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return self.creation.is_in_memory_db(self.settings_dict["NAME"])
 
 
+logger = logging.getLogger("django_libsql")
+
 FORMAT_QMARK_REGEX = _lazy_re_compile(r"(?<!%)%s")
+
+
+def _is_stream_error(exc):
+    """Check if an exception is a Turso/Hrana stream error (stale connection)."""
+    msg = str(exc).lower()
+    return "stream not found" in msg or "stream expired" in msg
 
 
 class SQLiteCursorWrapper:
@@ -348,8 +363,9 @@ class SQLiteCursorWrapper:
     In both cases, if you want to use a literal "%s", you'll need to use "%%s".
     """
 
-    def __init__(self, cursor):
+    def __init__(self, cursor, db=None):
         self._cursor = cursor
+        self._db = db
 
     def __getattr__(self, name):
         return getattr(self._cursor, name)
@@ -363,15 +379,49 @@ class SQLiteCursorWrapper:
     def __exit__(self, *args):
         self.close()
 
+    def _reconnect_and_retry(self, query, params=None, *, many=False):
+        """Reconnect the Django database connection and retry the query.
+
+        Called when a Hrana stream error is detected on a remote Turso database.
+        Closes the current connection (setting it to None) and re-establishes it
+        via Django's connect() machinery, then creates a fresh cursor and retries
+        the query exactly once.
+        """
+        logger.warning(
+            "Hrana stream error detected, reconnecting and retrying query: %s",
+            query[:120],
+        )
+        self._db.connection = None
+        self._db.connect()
+        self._cursor = self._db.connection.cursor()
+        if many:
+            self._cursor.executemany(query, params)
+        elif params is not None:
+            self._cursor.execute(query, params)
+        else:
+            self._cursor.execute(query)
+
     def execute(self, query, params=None):
         if params is None:
-            self._cursor.execute(query)
+            try:
+                self._cursor.execute(query)
+            except Exception as e:
+                if self._db and self._db._is_remote_db() and _is_stream_error(e):
+                    self._reconnect_and_retry(query)
+                else:
+                    raise
         else:
             # Extract names if params is a mapping, i.e. "pyformat" style is used.
             param_names = list(params) if isinstance(params, Mapping) else None
             query = self.convert_query(query, param_names=param_names)
             params = _adapt_params(params)
-            self._cursor.execute(query, params)
+            try:
+                self._cursor.execute(query, params)
+            except Exception as e:
+                if self._db and self._db._is_remote_db() and _is_stream_error(e):
+                    self._reconnect_and_retry(query, params)
+                else:
+                    raise
         # Return self so chaining like cursor.execute(...).fetchone() works.
         return self
 
@@ -384,8 +434,15 @@ class SQLiteCursorWrapper:
         else:
             param_names = None
         query = self.convert_query(query, param_names=param_names)
-        adapted = (_adapt_params(p) for p in param_list)
-        self._cursor.executemany(query, adapted)
+        # Materialize the adapted params so we can retry if needed.
+        adapted = list(_adapt_params(p) for p in param_list)
+        try:
+            self._cursor.executemany(query, adapted)
+        except Exception as e:
+            if self._db and self._db._is_remote_db() and _is_stream_error(e):
+                self._reconnect_and_retry(query, adapted, many=True)
+            else:
+                raise
         return self
 
     def convert_query(self, query, *, param_names=None):
