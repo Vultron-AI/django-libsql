@@ -163,6 +163,17 @@ class DatabaseOperations(BaseDatabaseOperations):
         # Native sqlite3 cursors cannot be used as context managers.
         try:
             return cursor.execute(sql, params).fetchone()
+        except Exception:
+            # If the underlying connection is stale (e.g., Hrana HTTP stream
+            # expired on Turso after idle time), fall back to simple repr()
+            # quoting. This is only used for debug logging, so approximate
+            # quoting is acceptable.
+            return tuple(
+                "'%s'" % str(p).replace("'", "''") if isinstance(p, str)
+                else "NULL" if p is None
+                else str(p)
+                for p in params
+            )
         finally:
             cursor.close()
 
